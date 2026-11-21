@@ -4,32 +4,39 @@
 #include <math.h>
 
 // =====================================================
-// WHAT THIS SKETCH DOES
+// WHAT THIS SKETCH DOES (NO-FILTER VERSION)
 // =====================================================
 //
 // Reads the ICM-42688-P gyro AND accelerometer 1000 times a second and
-// turns them into the drone's ORIENTATION (roll, pitch, yaw in degrees)
-// using a "complementary filter".
+// prints TWO separate orientation estimates side by side, with NO
+// filtering or blending at all:
+//
+//   1) ACCEL angles: roll and pitch worked out from which way gravity
+//      points. They never drift, but they are noisy, jump around when
+//      the motors vibrate, and are wrong while the drone accelerates.
+//
+//   2) GYRO angles: roll, pitch and yaw made by adding up the gyro's
+//      rotation rate every millisecond (angle += rate * dt). They are
+//      smooth and react instantly, but they slowly DRIFT away from the
+//      truth because small errors pile up.
 //
 //   roll  = tilt left/right   (rotation around the X axis)
 //   pitch = tilt nose up/down (rotation around the Y axis)
 //   yaw   = heading           (rotation around the Z axis)
 //
-// Why two sensors?
-//   - Gyro: measures how FAST we are rotating (degrees per second).
-//     Adding it up over time gives an angle that is smooth and fast,
-//     but it slowly DRIFTS because small errors pile up.
-//   - Accelerometer: measures which way GRAVITY points. That gives the
-//     tilt directly and never drifts, but it is NOISY and gets fooled
-//     by vibration and by the drone accelerating.
-//   The complementary filter trusts the gyro for quick changes and lets
-//   the accelerometer slowly pull the angle back to the truth.
+// Watching both lets you see each sensor's weakness on its own. The
+// complementary filter version (attitude_complementary) combines them
+// so each covers the other's weakness.
 //
-// Yaw: gravity points straight down no matter which way the nose faces,
-// so the accelerometer cannot correct yaw. Yaw comes from the gyro only
-// and WILL slowly drift. That is normal (fixing it needs a magnetometer).
+// The accelerometer cannot measure yaw (gravity points down whichever
+// way the nose faces), so yaw only comes from the gyro.
 //
-// The timing statistics from the original sketch are all still here.
+// The one correction still applied is the gyro bias calibration at
+// startup. It is not a filter: it just subtracts the gyro's constant
+// offset. Without it the gyro angles drift within seconds. To see
+// that, set GYRO_CAL_SAMPLES to 0.
+//
+// It also prints timing statistics (period, jitter, missed reads) for the 1 kHz loop.
 
 // =====================================================
 // CONFIGURATION
@@ -68,39 +75,16 @@
 #endif
 
 // =====================================================
-// FILTER SETTINGS
+// CALIBRATION SETTINGS
 // =====================================================
 
 // How many samples to average at startup to measure the gyro's bias.
 // 1000 samples at 1 ms each = about 1 second. KEEP THE BOARD STILL.
+// Set to 0 to skip calibration and see the raw gyro drift.
 #define GYRO_CAL_SAMPLES 1000
 
-// Complementary filter time constant, in seconds.
-//
-// Roughly: "how long until the accelerometer has pulled a drifting
-// angle most of the way back". Bigger = smoother and less sensitive to
-// vibration, but slower to fix drift. 0.5 s is a common starting point.
-//
-// Each update the filter computes
-//     alpha = TAU / (TAU + dt)
-//     angle = alpha * (angle + gyroRate * dt) + (1 - alpha) * accelAngle
-// At 1 kHz (dt = 0.001 s) and TAU = 0.5 s, alpha is about 0.998.
-//
-// Note: you will often see alpha = 0.98 in tutorials. Those assume a
-// ~50-100 Hz loop. At our 1000 Hz loop, 0.98 would mean trusting the
-// accelerometer far too much (a time constant of only ~0.05 s), so
-// motor vibration would leak straight into the angles.
-#define FILTER_TAU_S 0.5f
-
-// Only let the accelerometer correct the angle when the total
-// acceleration is close to 1 g. If it is far from 1 g, the drone is
-// accelerating or being shaken, and the accel no longer points at
-// gravity, so we rely on the gyro alone for that moment.
-#define ACCEL_TRUST_MIN_G 0.85f
-#define ACCEL_TRUST_MAX_G 1.15f
-
-// Ignore a dt bigger than this (seconds). Protects the filter if the
-// task is ever paused for a long time (e.g. a debugger break).
+// Ignore a dt bigger than this (seconds). Protects the gyro angles if
+// the task is ever paused for a long time (e.g. a debugger break).
 #define MAX_DT_S 0.01f
 
 #define RAD_TO_DEG_F 57.2957795f
@@ -147,7 +131,7 @@ struct ImuData {
     float gx, gy, gz;   // rotation rate in degrees/second
 };
 
-// The drone's estimated orientation, in degrees
+// Orientation in degrees (here: built from the gyro alone)
 struct Attitude {
     float roll;
     float pitch;
@@ -157,10 +141,14 @@ struct Attitude {
 struct TimingReport {
     uint32_t samples;
 
-    // Orientation estimate
-    float roll;
-    float pitch;
-    float yaw;
+    // Tilt from the accelerometer alone (this instant)
+    float accelRoll;
+    float accelPitch;
+
+    // Orientation from adding up the gyro alone
+    float gyroRoll;
+    float gyroPitch;
+    float gyroYaw;
 
     // Latest bias-corrected gyro rates (handy for debugging)
     float gyroX;
@@ -378,43 +366,14 @@ static inline float wrapAngle(float angle) {
     return angle;
 }
 
-// One step of the complementary filter.
+// Add up the gyro: angle += rate * time.
 //   imu: latest reading (gyro already bias-corrected)
 //   dt:  time since the previous step, in seconds
-// Returns the total acceleration in g, for the report.
-float updateAttitude(Attitude &att, const ImuData &imu, float dt) {
-
-    // 1) Gyro prediction: angle += rate * time
-    //    This alone would work for a while, then drift.
-    float gyroRoll  = att.roll  + imu.gx * dt;
-    float gyroPitch = att.pitch + imu.gy * dt;
-    att.yaw = wrapAngle(att.yaw + imu.gz * dt);   // gyro only, will drift
-
-    // 2) Accelerometer measurement of tilt
-    float accelRoll, accelPitch;
-    accelToAngles(imu, accelRoll, accelPitch);
-
-    // 3) Only trust the accel when it is mostly measuring gravity
-    float accelMag = sqrtf(
-        imu.ax * imu.ax + imu.ay * imu.ay + imu.az * imu.az
-    );
-
-    bool accelTrusted =
-        accelMag > ACCEL_TRUST_MIN_G &&
-        accelMag < ACCEL_TRUST_MAX_G;
-
-    if (accelTrusted) {
-        // 4) Blend: mostly gyro, plus a small nudge toward the accel.
-        float alpha = FILTER_TAU_S / (FILTER_TAU_S + dt);
-
-        att.roll  = alpha * gyroRoll  + (1.0f - alpha) * accelRoll;
-        att.pitch = alpha * gyroPitch + (1.0f - alpha) * accelPitch;
-    } else {
-        att.roll  = gyroRoll;
-        att.pitch = gyroPitch;
-    }
-
-    return accelMag;
+// Nothing corrects these angles, so they will slowly drift.
+void integrateGyro(Attitude &att, const ImuData &imu, float dt) {
+    att.roll  = wrapAngle(att.roll  + imu.gx * dt);
+    att.pitch = wrapAngle(att.pitch + imu.gy * dt);
+    att.yaw   = wrapAngle(att.yaw   + imu.gz * dt);
 }
 
 // =====================================================
@@ -424,6 +383,11 @@ float updateAttitude(Attitude &att, const ImuData &imu, float dt) {
 // Measures gyro bias and the starting tilt.
 // The board MUST be still (ideally flat) while this runs.
 bool calibrateIMU() {
+
+    if (GYRO_CAL_SAMPLES == 0) {
+        Serial.println("Calibration skipped: gyro bias NOT removed.");
+        return true;
+    }
 
     Serial.println("Calibrating... keep the board STILL.");
 
@@ -463,8 +427,8 @@ bool calibrateIMU() {
     gyroBiasY = (float)(sumGY / good);
     gyroBiasZ = (float)(sumGZ / good);
 
-    // Average accel reading gives a clean starting tilt, so the filter
-    // starts at the right angle instead of slowly drifting there.
+    // Average accel reading gives the starting tilt, so the gyro angles
+    // start from the board's real tilt instead of from 0.
     ImuData avg;
     avg.ax = (float)(sumAX / good);
     avg.ay = (float)(sumAY / good);
@@ -492,15 +456,19 @@ bool calibrateIMU() {
 }
 
 // =====================================================
-// FREERTOS IMU ACQUISITION + FILTER TASK
+// FREERTOS IMU ACQUISITION TASK
 // =====================================================
 
 void imuTask(void *parameter) {
 
     ImuData imu;
 
-    // This task is the only one that changes the orientation estimate
-    Attitude attitude = initialAttitude;
+    // Gyro-only angles. This task is the only one that changes them.
+    Attitude gyroAngles = initialAttitude;
+
+    // Accel-only angles, recalculated fresh every sample
+    float accelRoll = 0.0f;
+    float accelPitch = 0.0f;
     float accelMag = 1.0f;
 
     // Periodic scheduling
@@ -509,8 +477,8 @@ void imuTask(void *parameter) {
     // Initial timestamp
     int64_t previousTime = esp_timer_get_time();
 
-    // Timestamp of the last reading that went into the filter
-    int64_t previousFilterTime = previousTime;
+    // Timestamp of the last reading added to the gyro angles
+    int64_t previousGyroTime = previousTime;
 
     // Statistics
     uint32_t count = 0;
@@ -562,15 +530,19 @@ void imuTask(void *parameter) {
         imu.gy -= gyroBiasY;
         imu.gz -= gyroBiasZ;
 
-        // dt = real time since the last filter update, in seconds.
+        // dt = real time since the last gyro update, in seconds.
         // Using the measured time (not a fixed 0.001) keeps the angles
         // right even when a period runs a little long or short.
-        float dt = (float)(currentTime - previousFilterTime) / 1000000.0f;
-        previousFilterTime = currentTime;
+        float dt = (float)(currentTime - previousGyroTime) / 1000000.0f;
+        previousGyroTime = currentTime;
 
         if (dt > 0.0f && dt < MAX_DT_S) {
-            accelMag = updateAttitude(attitude, imu, dt);
+            integrateGyro(gyroAngles, imu, dt);
         }
+
+        // Tilt straight from the accelerometer, no smoothing
+        accelToAngles(imu, accelRoll, accelPitch);
+        accelMag = sqrtf(imu.ax * imu.ax + imu.ay * imu.ay + imu.az * imu.az);
 
         count++;
 
@@ -612,9 +584,12 @@ void imuTask(void *parameter) {
 
             report.samples = count;
 
-            report.roll  = attitude.roll;
-            report.pitch = attitude.pitch;
-            report.yaw   = attitude.yaw;
+            report.accelRoll  = accelRoll;
+            report.accelPitch = accelPitch;
+
+            report.gyroRoll  = gyroAngles.roll;
+            report.gyroPitch = gyroAngles.pitch;
+            report.gyroYaw   = gyroAngles.yaw;
 
             report.gyroX = imu.gx;
             report.gyroY = imu.gy;
@@ -670,14 +645,18 @@ void reportingTask(void *parameter) {
         ) == pdTRUE) {
 
             Serial.printf(
-                "Roll:%7.2f Pitch:%7.2f Yaw:%7.2f deg | "
+                "ACCEL Roll:%7.2f Pitch:%7.2f | "
+                "GYRO Roll:%7.2f Pitch:%7.2f Yaw:%7.2f deg | "
                 "Gyro X:%7.2f Y:%7.2f Z:%7.2f dps | |a|:%.2f g | "
                 "N:%lu Period:%.1f us (%.1f-%.1f) "
                 "Jitter max:%.1f avg:%.1f SD:%.1f us Missed:%lu\n",
 
-                report.roll,
-                report.pitch,
-                report.yaw,
+                report.accelRoll,
+                report.accelPitch,
+
+                report.gyroRoll,
+                report.gyroPitch,
+                report.gyroYaw,
 
                 report.gyroX,
                 report.gyroY,
@@ -713,7 +692,7 @@ void setup() {
 
     delay(1000);
 
-    Serial.println("\nStarting ESP32-S3 ICM-42688-P attitude test");
+    Serial.println("\nStarting ESP32-S3 ICM-42688-P no-filter attitude test");
 
     // Initialize sensor before starting tasks
     if (!initializeIMU()) {
@@ -767,7 +746,7 @@ void setup() {
         }
     }
 
-    // Create dedicated IMU acquisition + filter task on Core 1
+    // Create dedicated IMU acquisition task on Core 1
     BaseType_t imuResult = xTaskCreatePinnedToCore(
         imuTask,
         "ImuTask",
