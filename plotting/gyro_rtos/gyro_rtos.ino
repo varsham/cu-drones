@@ -1,115 +1,80 @@
-// Read the gyro at 1 kHz in a FreeRTOS task, print it from another task.
+// Reading the gyro 1000 times a second using FreeRTOS, and printing it from the other core.
 //
-// Three jobs, one function each:
-//   readTick()   grab one tick's raw bytes from the IMU into a buffer
-//   parseTick()  turn that buffer into x, y, z in deg/s
-//   printGyro()  write x, y, z to serial
-//
-// Two tasks use them:
-//   gyroTask  (core 1, high priority): readTick() every 1 ms, hands every 100th buffer to printTask
-//   printTask (core 0, low priority):  parseTick() + printGyro()
-// The fast task only moves bytes. All the slow work (math, Serial) happens on the other core.
+// the esp32-s3 has 2 cores. freertos lets us run "tasks" (functions that loop forever) on each one.
+// gyroTask runs on core 1: wakes up every 1 ms, reads the raw bytes, and every 100th read hands them over.
+// printTask runs on core 0: waits for bytes, turns them into deg/s, prints them.
+// printing is slow, so keeping it on the other core means it can never make a gyro read late.
 
 #include <SPI.h>
-
 const int CS = 10;
-const float LSB_PER_DPS = 16.4f;  // sensitivity at the default ±2000 dps range
-const int TICK_BYTES = 6;         // gyro x, y, z: 2 bytes each
-
-SPISettings imuSPI(1000000, MSBFIRST, SPI_MODE3);
-
-QueueHandle_t q;                  // FreeRTOS queue: a safe mailbox for passing data between tasks
-
-// ---------- SPI: talk to the IMU ----------
-
-void writeReg(uint8_t reg, uint8_t val) {
-  SPI.beginTransaction(imuSPI);
-  digitalWrite(CS, LOW);
-  SPI.transfer(reg);              // top bit 0 = write
-  SPI.transfer(val);
-  digitalWrite(CS, HIGH);
-  SPI.endTransaction();
-}
-
-void readRegs(uint8_t reg, uint8_t *buf, size_t n) {
-  SPI.beginTransaction(imuSPI);
-  digitalWrite(CS, LOW);
-  SPI.transfer(reg | 0x80);       // top bit 1 = read
-  for (size_t i = 0; i < n; i++) buf[i] = SPI.transfer(0x00);
-  digitalWrite(CS, HIGH);
-  SPI.endTransaction();
-}
-
-// ---------- the three jobs ----------
-
-// Read: everything the IMU gives us this tick, as raw bytes.
-void readTick(uint8_t *buf) {
-  readRegs(0x25, buf, TICK_BYTES);  // GYRO_DATA_X1 .. GYRO_DATA_Z0, high byte first
-}
-
-// Parse: raw bytes -> deg/s. Each axis is a signed 16-bit number split over two bytes.
-void parseTick(const uint8_t *buf, float &x, float &y, float &z) {
-  x = (int16_t)((buf[0] << 8) | buf[1]) / LSB_PER_DPS;
-  y = (int16_t)((buf[2] << 8) | buf[3]) / LSB_PER_DPS;
-  z = (int16_t)((buf[4] << 8) | buf[5]) / LSB_PER_DPS;
-}
-
-// Print: one line per reading.
-void printGyro(float x, float y, float z) {
-  Serial.printf("gx:%.2f gy:%.2f gz:%.2f\n", x, y, z);
-}
-
-// ---------- tasks (a task is just a function that loops forever) ----------
+const float LSB_PER_DPS = 16.4; // at the default +-2000 deg/s range, 16.4 raw counts = 1 deg/s
+QueueHandle_t q; // a freertos queue. it's a mailbox: one task drops bytes in, the other picks them up. safe across cores
 
 void gyroTask(void *param) {
-  TickType_t wake = xTaskGetTickCount();
-  uint8_t buf[TICK_BYTES];
+  uint8_t b[6]; // raw bytes from one read: x high, x low, y high, y low, z high, z low
   int count = 0;
+  TickType_t wake = xTaskGetTickCount(); // freertos keeps a tick counter. 1 tick = 1 ms on the esp32
 
   while (true) {
-    vTaskDelayUntil(&wake, pdMS_TO_TICKS(1));  // sleep until 1 ms after the last wake-up (no drift, unlike delay)
-    readTick(buf);
+    vTaskDelayUntil(&wake, pdMS_TO_TICKS(1)); // sleep until exactly 1 ms after the last wake up. unlike delay(1), time spent reading doesn't add up and drift
+
+    // read: grab the 6 gyro bytes
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3)); // 1mhz clock, msb first, mode 3
+    digitalWrite(CS, LOW); // start convo w imu
+    SPI.transfer(0x25 | 0x80); // read (0x80) starting at 0x25 (GYRO_DATA_X1). the imu moves to the next register each byte
+    for (int i = 0; i < 6; i++) b[i] = SPI.transfer(0x00); // 6 blank bytes to clock out x, y, z
+    digitalWrite(CS, HIGH); // end convo w imu
+    SPI.endTransaction();
 
     count++;
-    if (count == 100) {           // every 100th tick = 10 prints per second
-      xQueueOverwrite(q, buf);    // copy the buffer into the mailbox (replaces any unread one, never waits)
+    if (count == 100) { // every 100th read = 10 times a second, so the screen isn't a blur
+      xQueueOverwrite(q, b); // copy the bytes into the mailbox. if the old ones weren't picked up yet, replace them. never waits
       count = 0;
     }
   }
 }
 
 void printTask(void *param) {
-  uint8_t buf[TICK_BYTES];
-  float x, y, z;
+  uint8_t b[6];
 
   while (true) {
-    xQueueReceive(q, buf, portMAX_DELAY);  // sleep until a buffer arrives
-    parseTick(buf, x, y, z);
-    printGyro(x, y, z);
+    xQueueReceive(q, b, portMAX_DELAY); // sleep here (using no cpu) until bytes show up in the mailbox
+
+    // parse: glue each high + low byte into one signed number, then convert to deg/s
+    float gx = (int16_t)((b[0] << 8) | b[1]) / LSB_PER_DPS;
+    float gy = (int16_t)((b[2] << 8) | b[3]) / LSB_PER_DPS;
+    float gz = (int16_t)((b[4] << 8) | b[5]) / LSB_PER_DPS;
+
+    // print
+    Serial.printf("gx:%.2f gy:%.2f gz:%.2f\n", gx, gy, gz);
   }
 }
 
-// ---------- startup ----------
-
 void setup() {
-  Serial.begin(115200); delay(1000);
-  SPI.begin(12, 13, 11, CS);      // SCK, MISO, MOSI, CS
-  pinMode(CS, OUTPUT); digitalWrite(CS, HIGH);
 
-  uint8_t id;
-  readRegs(0x75, &id, 1);         // WHO_AM_I, expect 0x47
-  Serial.printf("WHO_AM_I = 0x%02X\n", id);
+  Serial.begin(115200);
+  delay(1000); // set baud rate, delay to add padding for connection sanity
+  SPI.begin(12, 13, 11, CS); // config wire setup (sck, miso, mosi, cs)
+  pinMode(CS, OUTPUT);
+  digitalWrite(CS, HIGH); // high on cs wire means imu is not listening
 
-  writeReg(0x4E, 0x0C);           // PWR_MGMT0: gyro on, low-noise mode (defaults: ±2000 dps, 1 kHz)
-  delay(100);                     // gyro needs time to start up
+  // turn the gyro on. it starts off by default. default rate is already 1000 readings/s
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+  digitalWrite(CS, LOW);
+  SPI.transfer(0x4E); // register 0x4E is PWR_MGMT0. top bit 0 = write
+  SPI.transfer(0x0C); // 0x0C = gyro on in low noise mode, accel off
+  digitalWrite(CS, HIGH);
+  SPI.endTransaction();
+  delay(100); // gyro needs time to spin up
 
-  q = xQueueCreate(1, TICK_BYTES);  // holds one tick's buffer
+  q = xQueueCreate(1, 6); // mailbox with room for 1 item of 6 bytes (xQueueOverwrite only works with room for 1)
 
-  // (function, name, stack bytes, param, priority, handle, core). Higher priority runs first.
+  // start the tasks: (function, name, stack size in bytes, param, priority, handle, core)
+  // higher priority number = runs first. gyroTask gets 4 so nothing on core 1 can delay it
   xTaskCreatePinnedToCore(printTask, "print", 4096, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(gyroTask,  "gyro",  4096, NULL, 4, NULL, 1);
+  xTaskCreatePinnedToCore(gyroTask, "gyro", 4096, NULL, 4, NULL, 1);
 }
 
 void loop() {
-  vTaskDelay(pdMS_TO_TICKS(1000));  // loop() is a task too; nothing to do, so sleep
+  vTaskDelay(pdMS_TO_TICKS(1000)); // loop() is secretly a task too. nothing to do here, so just sleep
 }
