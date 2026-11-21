@@ -1,4 +1,6 @@
 // Reading gyro rates (deg/s) from the IMU, with the bias removed.
+// datasheet (ICM-42688-P, DS-000347): https://invensense.tdk.com/en-us/download-resource/ds-000347-icm-42688-p-datasheet
+// register addresses and the 16.4 sensitivity below all come from it
 
 #include <SPI.h>
 const int CS = 10;
